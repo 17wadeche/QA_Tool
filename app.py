@@ -427,17 +427,15 @@ with st.expander("Model request settings", expanded=False):
         step=100,
     )
     stream = st.checkbox("stream", value=False)
-uploaded_file = st.file_uploader(
-    "Upload an Excel workbook",
-    type=["xlsx"],
-)
-partial_result_files = st.file_uploader(
+uploaded_files = st.file_uploader(
+    "Upload Excel workbooks",
     "Resume from partial results workbooks (optional)",
     type=["xlsx"],
     accept_multiple_files=True,
     help=(
-        "Upload one or more results workbooks exported by this tool. Successful "
-        "rows are combined, and only rows still missing from the raw workbook are sent."
+        "Upload the raw complaint workbook and, optionally, one or more results "
+        "workbooks exported by this tool. Existing results are combined, and rows "
+        "with an HTTP 200 response are not sent again."
     ),
 )
 st.markdown(
@@ -482,22 +480,6 @@ if "last_uploaded_fingerprint" not in st.session_state:
     st.session_state.last_uploaded_fingerprint = None
 if "loaded_partial_fingerprints" not in st.session_state:
     st.session_state.loaded_partial_fingerprints = set()
-if uploaded_file is not None:
-    current_uploaded_name = uploaded_file.name
-    current_uploaded_fingerprint = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
-    if st.session_state.last_uploaded_fingerprint != current_uploaded_fingerprint:
-        st.session_state.processed_results = None
-        st.session_state.processed_preview_df = None
-        st.session_state.processed_workbook_info = None
-        st.session_state.processed_tier_summary_df = None
-        st.session_state.processed_organized_results_df = None
-        st.session_state.processed_clean_display_df = None
-        st.session_state.processed_pretty_review_df = None
-        st.session_state.processed_html_review_df = None
-        st.session_state.processed_results_xlsx = None
-        st.session_state.loaded_partial_fingerprints = set()
-        st.session_state.last_uploaded_filename = current_uploaded_name
-        st.session_state.last_uploaded_fingerprint = current_uploaded_fingerprint
 DASH_TRANSLATION = str.maketrans({
     "\u2010": "-",
     "\u2011": "-",
@@ -1665,11 +1647,13 @@ def read_partial_results_workbook(uploaded):
     return results_df[results_df["row_number"].notna()].copy()
 def is_success_value(value):
     return value is True or normalize_text(value) in {"true", "1", "yes"}
+def has_http_200_response(row):
+    status_code = pd.to_numeric(row.get("status_code"), errors="coerce")
+    return pd.notna(status_code) and int(status_code) == 200
 def successful_result_rows(results_df):
     if results_df is None or results_df.empty:
         return set()
-    success_values = results_df["success"]
-    success_mask = success_values.map(is_success_value)
+    success_mask = results_df.apply(has_http_200_response, axis=1)
     return set(
         pd.to_numeric(results_df.loc[success_mask, "row_number"], errors="coerce")
         .dropna().astype(int).tolist()
@@ -1681,7 +1665,7 @@ def merge_result_frames(*frames):
     combined = pd.concat(usable_frames, ignore_index=True, sort=False)
     combined["row_number"] = pd.to_numeric(combined["row_number"], errors="coerce")
     combined = combined[combined["row_number"].notna()].copy()
-    combined["_successful"] = combined["success"].map(is_success_value)
+    combined["_successful"] = combined.apply(has_http_200_response, axis=1)    
     combined = combined.sort_values("_successful", kind="stable")
     combined = combined.drop_duplicates(subset=["row_number"], keep="last")
     return combined.drop(columns=["_successful"]).sort_values("row_number").reset_index(drop=True)
@@ -1772,9 +1756,56 @@ def render_saved_results():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="persistent_download_button"
         )
-if uploaded_file is not None:
+if uploaded_files:
     try:
-        raw_workbook, reader_name = read_workbook_as_raw_dataframes(uploaded_file)
+        uploaded_file = None
+        raw_workbook = None
+        reader_name = None
+        partial_result_files = []
+        for candidate_file in uploaded_files:
+            candidate_bytes = io.BytesIO(candidate_file.getvalue())
+            candidate_excel = pd.ExcelFile(candidate_bytes, engine="openpyxl")
+            if "Model Results" in candidate_excel.sheet_names:
+                partial_result_files.append(candidate_file)
+                continue
+            candidate_workbook, candidate_reader = read_workbook_as_raw_dataframes(candidate_file)
+            has_main_sheet = any(
+                infer_sheet_role(sheet_name, prepare_sheet_dataframe(raw_df)) == "main"
+                for sheet_name, raw_df in candidate_workbook.items()
+            )
+            if has_main_sheet:
+                if uploaded_file is not None:
+                    raise ValueError(
+                        "More than one raw complaint workbook was uploaded. Upload one raw "
+                        "workbook plus any number of results workbooks."
+                    )
+                uploaded_file = candidate_file
+                raw_workbook = candidate_workbook
+                reader_name = candidate_reader
+            else:
+                raise ValueError(
+                    f"{candidate_file.name} is neither a raw complaint workbook nor a "
+                    "results workbook exported by this tool."
+                )
+        if uploaded_file is None:
+            raise ValueError(
+                "Upload one raw complaint workbook. Results workbooks can be included "
+                "in the same upload selection."
+            )
+        current_uploaded_fingerprint = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+        if st.session_state.last_uploaded_fingerprint != current_uploaded_fingerprint:
+            st.session_state.processed_results = None
+            st.session_state.processed_preview_df = None
+            st.session_state.processed_workbook_info = None
+            st.session_state.processed_tier_summary_df = None
+            st.session_state.processed_organized_results_df = None
+            st.session_state.processed_clean_display_df = None
+            st.session_state.processed_pretty_review_df = None
+            st.session_state.processed_html_review_df = None
+            st.session_state.processed_results_xlsx = None
+            st.session_state.loaded_partial_fingerprints = set()
+            st.session_state.last_uploaded_filename = uploaded_file.name
+            st.session_state.last_uploaded_fingerprint = current_uploaded_fingerprint
         main_sheet_name = None
         workbook_info = []
         processed_sheets = {}
@@ -1837,7 +1868,7 @@ if uploaded_file is not None:
         missing_row_numbers = all_row_numbers.difference(completed_row_numbers)
         failed_row_numbers = set()
         if previous_results is not None and not previous_results.empty:
-            failed_mask = ~previous_results["success"].map(is_success_value)
+            failed_mask = ~previous_results.apply(has_http_200_response, axis=1)
             failed_row_numbers = set(
                 pd.to_numeric(previous_results.loc[failed_mask, "row_number"], errors="coerce")
                 .dropna().astype(int).tolist()
