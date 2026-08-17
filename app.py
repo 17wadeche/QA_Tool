@@ -427,15 +427,15 @@ with st.expander("Model request settings", expanded=False):
         step=100,
     )
     stream = st.checkbox("stream", value=False)
-st.caption("Resume from partial results workbooks (optional)")
+st.caption("Upload a raw workbook to start, or reupload an exported results workbook to resume")
 uploaded_files = st.file_uploader(
     "Upload Excel workbooks",
     type=["xlsx"],
     accept_multiple_files=True,
     help=(
-        "Upload the raw complaint workbook and, optionally, one or more results "
-        "workbooks exported by this tool. Existing results are combined, and rows "
-        "with an HTTP 200 response are not sent again."
+        "Upload a raw complaint workbook to start. To resume, upload just a results "
+        "workbook exported by this tool; it already contains the input rows. You can "
+        "also include additional results workbooks to combine their completed rows."
     ),
 )
 st.markdown(
@@ -1645,6 +1645,32 @@ def read_partial_results_workbook(uploaded):
     results_df = results_df.copy()
     results_df["row_number"] = pd.to_numeric(results_df["row_number"], errors="coerce")
     return results_df[results_df["row_number"].notna()].copy()
+def read_embedded_input_workbook(uploaded):
+    try:
+        input_df = pd.read_excel(
+            io.BytesIO(uploaded.getvalue()),
+            sheet_name="Input Preview",
+            engine="openpyxl",
+            dtype=object,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{uploaded.name} does not contain an 'Input Preview' sheet. "
+            "Upload the original raw complaint workbook with this older results workbook."
+        ) from exc
+    if input_df.empty:
+        raise ValueError(f"{uploaded.name} contains an empty 'Input Preview' sheet.")
+    input_df.columns = dedupe_columns(input_df.columns)
+    required_columns = {"Product Event ID", "Event Description - PE"}
+    missing_columns = required_columns.difference(input_df.columns)
+    if missing_columns:
+        raise ValueError(
+            f"{uploaded.name}'s 'Input Preview' sheet is missing required input column(s): "
+            f"{', '.join(sorted(missing_columns))}."
+        )
+    return {"Input Preview": pd.DataFrame(
+        [input_df.columns.tolist(), *input_df.values.tolist()]
+    )}
 def is_success_value(value):
     return value is True or normalize_text(value) in {"true", "1", "yes"}
 def has_http_200_response(row):
@@ -1788,10 +1814,11 @@ if uploaded_files:
                     "results workbook exported by this tool."
                 )
         if uploaded_file is None:
-            raise ValueError(
-                "Upload one raw complaint workbook. Results workbooks can be included "
-                "in the same upload selection."
-            )
+            if not partial_result_files:
+                raise ValueError("Upload a raw complaint workbook or an exported results workbook.")
+            uploaded_file = partial_result_files[0]
+            raw_workbook = read_embedded_input_workbook(uploaded_file)
+            reader_name = "embedded Input Preview"
         current_uploaded_fingerprint = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
         if st.session_state.last_uploaded_fingerprint != current_uploaded_fingerprint:
             st.session_state.processed_results = None
