@@ -431,6 +431,15 @@ uploaded_file = st.file_uploader(
     "Upload an Excel workbook",
     type=["xlsx"],
 )
+partial_result_files = st.file_uploader(
+    "Resume from partial results workbooks (optional)",
+    type=["xlsx"],
+    accept_multiple_files=True,
+    help=(
+        "Upload one or more results workbooks exported by this tool. Successful "
+        "rows are combined, and only rows still missing from the raw workbook are sent."
+    ),
+)
 st.markdown(
     '<div class="small-note">Upload the raw complaint workbook to run layered screening, MDTGPT consistency review, and tiered prioritization.</div>',
     unsafe_allow_html=True
@@ -471,6 +480,8 @@ if "last_uploaded_filename" not in st.session_state:
     st.session_state.last_uploaded_filename = None
 if "last_uploaded_fingerprint" not in st.session_state:
     st.session_state.last_uploaded_fingerprint = None
+if "loaded_partial_fingerprints" not in st.session_state:
+    st.session_state.loaded_partial_fingerprints = set()
 if uploaded_file is not None:
     current_uploaded_name = uploaded_file.name
     current_uploaded_fingerprint = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
@@ -484,6 +495,7 @@ if uploaded_file is not None:
         st.session_state.processed_pretty_review_df = None
         st.session_state.processed_html_review_df = None
         st.session_state.processed_results_xlsx = None
+        st.session_state.loaded_partial_fingerprints = set()
         st.session_state.last_uploaded_filename = current_uploaded_name
         st.session_state.last_uploaded_fingerprint = current_uploaded_fingerprint
 DASH_TRANSLATION = str.maketrans({
@@ -1629,6 +1641,50 @@ def make_results_xlsx_bytes(
         write_sheet(writer, pd.DataFrame(workbook_info), "Workbook Summary")
     output.seek(0)
     return output.getvalue()
+def read_partial_results_workbook(uploaded):
+    try:
+        results_df = pd.read_excel(
+            io.BytesIO(uploaded.getvalue()),
+            sheet_name="Model Results",
+            engine="openpyxl",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"{uploaded.name} does not contain a 'Model Results' sheet. "
+            "Please upload an XLSX exported by this tool."
+        ) from exc
+    required_columns = {"row_number", "success"}
+    missing_columns = required_columns.difference(results_df.columns)
+    if missing_columns:
+        raise ValueError(
+            f"{uploaded.name} is missing required result column(s): "
+            f"{', '.join(sorted(missing_columns))}."
+        )
+    results_df = results_df.copy()
+    results_df["row_number"] = pd.to_numeric(results_df["row_number"], errors="coerce")
+    return results_df[results_df["row_number"].notna()].copy()
+def is_success_value(value):
+    return value is True or normalize_text(value) in {"true", "1", "yes"}
+def successful_result_rows(results_df):
+    if results_df is None or results_df.empty:
+        return set()
+    success_values = results_df["success"]
+    success_mask = success_values.map(is_success_value)
+    return set(
+        pd.to_numeric(results_df.loc[success_mask, "row_number"], errors="coerce")
+        .dropna().astype(int).tolist()
+    )
+def merge_result_frames(*frames):
+    usable_frames = [frame.copy() for frame in frames if frame is not None and not frame.empty]
+    if not usable_frames:
+        return pd.DataFrame()
+    combined = pd.concat(usable_frames, ignore_index=True, sort=False)
+    combined["row_number"] = pd.to_numeric(combined["row_number"], errors="coerce")
+    combined = combined[combined["row_number"].notna()].copy()
+    combined["_successful"] = combined["success"].map(is_success_value)
+    combined = combined.sort_values("_successful", kind="stable")
+    combined = combined.drop_duplicates(subset=["row_number"], keep="last")
+    return combined.drop(columns=["_successful"]).sort_values("row_number").reset_index(drop=True)
 def save_processing_checkpoint(results, preview_df, workbook_info):
     results_df = pd.DataFrame(results)
     organized_results_df, _ = build_tier_organization(results_df)
@@ -1749,10 +1805,39 @@ if uploaded_file is not None:
         st.write(f"Main sheet: {main_sheet_name}")
         st.write(f"Main rows found: {len(main_df)}")
         st.write(f"Model endpoint: `{get_model_endpoint()}`")
+        newly_loaded_partials = []
+        for partial_file in partial_result_files:
+            partial_fingerprint = hashlib.sha256(partial_file.getvalue()).hexdigest()
+            if partial_fingerprint in st.session_state.loaded_partial_fingerprints:
+                continue
+            partial_df = read_partial_results_workbook(partial_file)
+            valid_row_numbers = set((main_df.index + 1).astype(int).tolist())
+            partial_df = partial_df[
+                partial_df["row_number"].astype(int).isin(valid_row_numbers)
+            ].copy()
+            newly_loaded_partials.append(partial_df)
+            st.session_state.loaded_partial_fingerprints.add(partial_fingerprint)
+        if newly_loaded_partials:
+            st.session_state.processed_results = merge_result_frames(
+                st.session_state.processed_results,
+                *newly_loaded_partials,
+            )
+            save_processing_checkpoint(
+                st.session_state.processed_results.to_dict("records"),
+                preview_df,
+                workbook_info,
+            )
+            st.success(
+                f"Loaded {len(newly_loaded_partials)} partial workbook(s). "
+                "Successful rows will not be sent again."
+            )
         previous_results = st.session_state.processed_results
+        completed_row_numbers = successful_result_rows(previous_results)
+        all_row_numbers = set((main_df.index + 1).astype(int).tolist())
+        missing_row_numbers = all_row_numbers.difference(completed_row_numbers)
         failed_row_numbers = set()
         if previous_results is not None and not previous_results.empty:
-            failed_mask = ~previous_results["success"].fillna(False).astype(bool)
+            failed_mask = ~previous_results["success"].map(is_success_value)
             failed_row_numbers = set(
                 pd.to_numeric(previous_results.loc[failed_mask, "row_number"], errors="coerce")
                 .dropna().astype(int).tolist()
@@ -1768,12 +1853,26 @@ if uploaded_file is not None:
             value=False,
             help="Leave this off to avoid a long-running retry cycle. Failed rows can be retried later.",
         )
+        batch_size = st.number_input(
+            "Rows to process before pausing",
+            min_value=1,
+            max_value=max(1, len(main_df)),
+            value=min(25, max(1, len(missing_row_numbers))),
+            help=(
+                "The run automatically pauses after this many rows. A downloadable "
+                "checkpoint is rebuilt after every row, so you can safely stop between batches."
+            ),
+        )
+        st.info(
+            f"{len(completed_row_numbers)} row(s) complete; "
+            f"{len(missing_row_numbers)} row(s) remain."
+        )
         button_label = (
             f"Retry {len(failed_row_numbers)} failed row(s)"
             if retry_only_failed and failed_row_numbers
-            else "Send rows to MDTGPT Model"
+            else f"Process next {min(int(batch_size), len(missing_row_numbers))} row(s)"
         )
-        if st.button(button_label):
+        if st.button(button_label, disabled=not missing_row_numbers):
             errors = []
             if selected_portfolio == "Select Portfolio":
                 errors.append("Please select a Portfolio.")
@@ -1790,19 +1889,20 @@ if uploaded_file is not None:
                     st.error(error)
                 st.stop()
             session = requests.Session()
-            run_df = main_df
-            results = []
-            if retry_only_failed and failed_row_numbers:
-                run_df = main_df[
-                    pd.Series(main_df.index + 1, index=main_df.index).isin(failed_row_numbers)
-                ].copy()
+            rows_to_run = failed_row_numbers if retry_only_failed and failed_row_numbers else missing_row_numbers
+            run_df = main_df[
+                pd.Series(main_df.index + 1, index=main_df.index).isin(rows_to_run)
+            ].head(int(batch_size)).copy()
+            results = [] if previous_results is None else previous_results.to_dict("records")
+            selected_row_numbers = set((run_df.index + 1).astype(int).tolist())
+            if previous_results is not None and not previous_results.empty:
                 results = previous_results[
                     ~pd.to_numeric(previous_results["row_number"], errors="coerce")
-                    .isin(failed_row_numbers)
+                    .isin(selected_row_numbers)
                 ].to_dict("records")
             failed_rows = []
-            success_count = sum(bool(record.get("success")) for record in results)
-            failure_count = 0
+            success_count = sum(is_success_value(record.get("success")) for record in results)
+            failure_count = sum(not is_success_value(record.get("success")) for record in results)
             progress = st.progress(0)
             status_box = st.empty()
             for processed_index, (idx, row) in enumerate(run_df.iterrows(), start=1):
@@ -2075,6 +2175,14 @@ if uploaded_file is not None:
             st.session_state.processed_pretty_review_df = pretty_review_df
             st.session_state.processed_html_review_df = html_review_df
             st.session_state.processed_results_xlsx = results_xlsx
+            remaining_count = len(all_row_numbers.difference(successful_result_rows(results_df)))
+            if remaining_count:
+                st.success(
+                    f"Checkpoint saved. Processing is paused with {remaining_count} row(s) remaining. "
+                    "Download the workbook below or process another batch when ready."
+                )
+            else:
+                st.success("All rows are complete and the final workbook is ready to download.")
         render_saved_results()
     except Exception as e:
         st.error(f"Failed to read or process the workbook: {e}")
