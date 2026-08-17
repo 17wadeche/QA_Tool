@@ -427,9 +427,9 @@ with st.expander("Model request settings", expanded=False):
         step=100,
     )
     stream = st.checkbox("stream", value=False)
+st.caption("Resume from partial results workbooks (optional)")
 uploaded_files = st.file_uploader(
     "Upload Excel workbooks",
-    "Resume from partial results workbooks (optional)",
     type=["xlsx"],
     accept_multiple_files=True,
     help=(
