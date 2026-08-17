@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import math
 import os
@@ -468,9 +469,12 @@ if "processed_results_xlsx" not in st.session_state:
     st.session_state.processed_results_xlsx = None
 if "last_uploaded_filename" not in st.session_state:
     st.session_state.last_uploaded_filename = None
+if "last_uploaded_fingerprint" not in st.session_state:
+    st.session_state.last_uploaded_fingerprint = None
 if uploaded_file is not None:
     current_uploaded_name = uploaded_file.name
-    if st.session_state.last_uploaded_filename != current_uploaded_name:
+    current_uploaded_fingerprint = hashlib.sha256(uploaded_file.getvalue()).hexdigest()
+    if st.session_state.last_uploaded_fingerprint != current_uploaded_fingerprint:
         st.session_state.processed_results = None
         st.session_state.processed_preview_df = None
         st.session_state.processed_workbook_info = None
@@ -481,6 +485,7 @@ if uploaded_file is not None:
         st.session_state.processed_html_review_df = None
         st.session_state.processed_results_xlsx = None
         st.session_state.last_uploaded_filename = current_uploaded_name
+        st.session_state.last_uploaded_fingerprint = current_uploaded_fingerprint
 DASH_TRANSLATION = str.maketrans({
     "\u2010": "-",
     "\u2011": "-",
@@ -1624,6 +1629,29 @@ def make_results_xlsx_bytes(
         write_sheet(writer, pd.DataFrame(workbook_info), "Workbook Summary")
     output.seek(0)
     return output.getvalue()
+def save_processing_checkpoint(results, preview_df, workbook_info):
+    results_df = pd.DataFrame(results)
+    organized_results_df, _ = build_tier_organization(results_df)
+    clean_display_df = build_clean_display_df(organized_results_df)
+    tier_summary_df = build_enhanced_tier_summary(organized_results_df)
+    pretty_review_df = build_pretty_review_df(organized_results_df)
+    st.session_state.processed_results = results_df
+    st.session_state.processed_preview_df = preview_df
+    st.session_state.processed_workbook_info = workbook_info
+    st.session_state.processed_tier_summary_df = tier_summary_df
+    st.session_state.processed_organized_results_df = organized_results_df
+    st.session_state.processed_clean_display_df = clean_display_df
+    st.session_state.processed_pretty_review_df = pretty_review_df
+    st.session_state.processed_html_review_df = build_html_review_df(organized_results_df)
+    st.session_state.processed_results_xlsx = make_results_xlsx_bytes(
+        results_df=results_df,
+        preview_df=preview_df,
+        workbook_info=workbook_info,
+        tier_summary_df=tier_summary_df,
+        organized_results_df=organized_results_df,
+        clean_display_df=clean_display_df,
+        pretty_review_df=pretty_review_df,
+    )
 def render_saved_results():
     if st.session_state.processed_organized_results_df is None:
         return
@@ -1721,7 +1749,31 @@ if uploaded_file is not None:
         st.write(f"Main sheet: {main_sheet_name}")
         st.write(f"Main rows found: {len(main_df)}")
         st.write(f"Model endpoint: `{get_model_endpoint()}`")
-        if st.button("Send rows to MDTGPT Model"):
+        previous_results = st.session_state.processed_results
+        failed_row_numbers = set()
+        if previous_results is not None and not previous_results.empty:
+            failed_mask = ~previous_results["success"].fillna(False).astype(bool)
+            failed_row_numbers = set(
+                pd.to_numeric(previous_results.loc[failed_mask, "row_number"], errors="coerce")
+                .dropna().astype(int).tolist()
+            )
+        retry_only_failed = st.checkbox(
+            "Retry only failed rows from the saved run",
+            value=bool(failed_row_numbers),
+            disabled=not failed_row_numbers,
+            help="Keeps successful results and sends only rows that previously failed.",
+        )
+        automatic_retry_failed = st.checkbox(
+            "Automatically retry failed rows at the end",
+            value=False,
+            help="Leave this off to avoid a long-running retry cycle. Failed rows can be retried later.",
+        )
+        button_label = (
+            f"Retry {len(failed_row_numbers)} failed row(s)"
+            if retry_only_failed and failed_row_numbers
+            else "Send rows to MDTGPT Model"
+        )
+        if st.button(button_label):
             errors = []
             if selected_portfolio == "Select Portfolio":
                 errors.append("Please select a Portfolio.")
@@ -1738,13 +1790,22 @@ if uploaded_file is not None:
                     st.error(error)
                 st.stop()
             session = requests.Session()
+            run_df = main_df
             results = []
+            if retry_only_failed and failed_row_numbers:
+                run_df = main_df[
+                    pd.Series(main_df.index + 1, index=main_df.index).isin(failed_row_numbers)
+                ].copy()
+                results = previous_results[
+                    ~pd.to_numeric(previous_results["row_number"], errors="coerce")
+                    .isin(failed_row_numbers)
+                ].to_dict("records")
             failed_rows = []
-            success_count = 0
+            success_count = sum(bool(record.get("success")) for record in results)
             failure_count = 0
             progress = st.progress(0)
             status_box = st.empty()
-            for processed_index, (idx, row) in enumerate(main_df.iterrows(), start=1):
+            for processed_index, (idx, row) in enumerate(run_df.iterrows(), start=1):
                 row_number = int(idx) + 1
                 row_dict = clean_row(row.drop(labels=["join_key"], errors="ignore").to_dict())
                 layer1_result = layer1_rule_based_screening(row_dict=row_dict)
@@ -1883,13 +1944,14 @@ if uploaded_file is not None:
                         "complaint_record": complaint_record,
                         "request_json": request_json,
                     })
-                percent_complete = int((processed_index / len(main_df)) * 100)
+                save_processing_checkpoint(results, preview_df, workbook_info)
+                percent_complete = int((processed_index / len(run_df)) * 100)
                 progress.progress(percent_complete)
                 status_box.write(
-                    f"Processed {processed_index}/{len(main_df)} rows. "
+                    f"Processed {processed_index}/{len(run_df)} rows. "
                     f"Success: {success_count}, Failed: {failure_count}"
                 )
-            if failed_rows:
+            if failed_rows and automatic_retry_failed:
                 st.write(f"Retrying {len(failed_rows)} failed rows...")
                 retry_session = requests.Session()
                 retry_success_count = 0
