@@ -25,6 +25,13 @@ def bundled_path(filename):
         getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
     )
     return base_directory / filename
+def installed_app_path(app_directory, filename):
+    app_directory = Path(app_directory)
+    candidates = (
+        app_directory / filename,
+        app_directory / "_internal" / filename,
+    )
+    return next((path for path in candidates if path.is_file()), candidates[0])
 def show_message(title, message, flags=0):
     return ctypes.windll.user32.MessageBoxW(
         None,
@@ -158,7 +165,7 @@ def check_for_updates():
         download_update(asset, archive_path)
         safely_extract(archive_path, extracted_path)
         staged_app = locate_extracted_app(extracted_path)
-        staged_version = (staged_app / "VERSION").read_text(
+        staged_version = installed_app_path(staged_app, "VERSION").read_text(
             encoding="utf-8"
         ).strip()
         if not versions_match(staged_version, latest_version):
