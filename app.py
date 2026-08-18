@@ -260,6 +260,8 @@ DEFAULT_BASE_MODELS_URL = "https://api.gpt.medtronic.com/providers/medtronicgpt/
 DEFAULT_MODEL_ID = "gpt-41"
 SYSTEM_PROMPT = """You are assisting with QA post-process monitoring of raw complaint/product event handling. Review each record only for inconsistencies between coded fields and related record content. Do not make assumptions beyond the information provided. Do not make final regulatory, compliance, or clinical decisions.
 
+Each record may include multiple product line items (PLIs) for the same Product Event ID. Evaluate the current PLI in the context of all related PLIs, not as an isolated record. The event description can describe a problem with only one of several PLIs. Do not flag the other PLIs merely because their individual coding does not describe that problem. Flag coding only when the collective PLI context shows that the coding for the applicable PLI(s) is missing, contradictory, or otherwise inconsistent.
+
 Focus only on these three checks:
 
 Inconsistency between coding and the Event Description
@@ -286,7 +288,7 @@ USER_PROMPT_TEMPLATE = """Review the raw complaint/product event record below fo
 Evaluate only these three areas:
 
 Coding vs. Event Description
-Determine whether coded fields such as RFR Code and FDP Code are consistent with Event Description - PE and other narrative text.
+Determine whether coded fields such as RFR Code and FDP Code are consistent with Event Description - PE and other narrative text. Cross-reference every related PLI for the Product Event ID before deciding. A problem that applies to one PLI does not require every sibling PLI to carry matching complaint coding.
 
 Coding vs. Regulatory Decisions
 Determine whether coded fields and event severity are consistent with Reportable and country FER fields.
@@ -744,6 +746,8 @@ def add_join_key(df):
 def build_complaint_record(row_dict, row_number):
     return {
         "rowNumber": row_number,
+        "currentPli": row_dict,
+        "relatedPlis": [],
         "focusChecks": [
             "Coding vs. Event Description",
             "Coding vs. Regulatory Decisions",
@@ -751,6 +755,42 @@ def build_complaint_record(row_dict, row_number):
         ],
         "data": row_dict,
     }
+PLI_CONTEXT_FIELDS = [
+    "Product Event ID",
+    "PE - PLI #",
+    "Complaint? - PE",
+    "Product Description - PE PLI",
+    "RFR Code",
+    "FDP Code",
+    "Reportable?",
+    "Investigation Required?",
+    "Event Description - PE",
+    "Summary of Investigation Results",
+    "PLI Tasks",
+    "Rationale for no return - PE PLI",
+]
+def build_related_pli_lookup(df):
+    related_by_event = {}
+    for idx, row in df.iterrows():
+        row_dict = clean_row(row.drop(labels=["join_key"], errors="ignore").to_dict())
+        product_event_ids = extract_ids(row_dict.get("Product Event ID"))
+        if not product_event_ids:
+            continue
+        context = {
+            "sourceRowNumber": int(idx) + 1,
+            **{field: row_dict.get(field) for field in PLI_CONTEXT_FIELDS},
+        }
+        related_by_event.setdefault(product_event_ids[0], []).append(context)
+    return related_by_event
+def add_related_plis(complaint_record, row_dict, related_pli_lookup):
+    product_event_ids = extract_ids(row_dict.get("Product Event ID"))
+    related_plis = related_pli_lookup.get(product_event_ids[0], []) if product_event_ids else []
+    complaint_record["relatedPlis"] = related_plis
+    complaint_record["pliEvaluationInstruction"] = (
+        "Evaluate currentPli using relatedPlis collectively. Do not treat a sibling PLI as "
+        "miscoded solely because the event description concerns a different PLI."
+    )
+    return complaint_record
 def build_user_prompt(complaint_record):
     initial_json = json.dumps(complaint_record, ensure_ascii=False, default=str, indent=2)
     return USER_PROMPT_TEMPLATE.format(initial_json=initial_json)
@@ -836,7 +876,7 @@ def find_matched_keywords(text, keywords):
 def any_regional_fer_yes(row_dict):
     fer_fields = ["Brazil FER", "China FER", "Japan FER", "Korea FER"]
     return any(yes_like(row_dict.get(field)) for field in fer_fields)
-def layer1_rule_based_screening(row_dict):
+def layer1_rule_based_screening(row_dict, related_plis=None):
     flags = []
     reasons = []
     score = 0
@@ -870,7 +910,19 @@ def layer1_rule_based_screening(row_dict):
         reasons.append(f"Fire-related keyword(s) found in raw text: {', '.join(sorted(set(fire_matches)))}")
         score += 4
     severe_signal_present = bool(death_matches or serious_injury_matches or fire_matches)
-    if event_description and not rfr_code and not fdp_code:
+    related_plis = related_plis or []
+    sibling_complaint_is_coded = any(
+        yes_like(pli.get("Complaint? - PE"))
+        and (safe_text(pli.get("RFR Code")) or safe_text(pli.get("FDP Code")))
+        for pli in related_plis
+    )
+    current_is_non_complaint = no_like(row_dict.get("Complaint? - PE"))
+    if (
+        event_description
+        and not rfr_code
+        and not fdp_code
+        and not (current_is_non_complaint and sibling_complaint_is_coded)
+    ):
         flags.append("coding_event_description_rule_flag")
         reasons.append("Event Description is present but both RFR Code and FDP Code are blank")
         score += 3
@@ -1857,6 +1909,7 @@ if uploaded_files:
         main_df = ensure_key_columns(processed_sheets[main_sheet_name]["df"])
         main_df = add_join_key(main_df)
         main_df = main_df[main_df["join_key"].notna() & (main_df["join_key"].astype(str) != "")].copy()
+        related_pli_lookup = build_related_pli_lookup(main_df)
         preview_df = main_df.copy()
         st.subheader("Main Sheet Preview")
         st.dataframe(preview_df.head(10).drop(columns=["join_key"], errors="ignore"), use_container_width=True)
@@ -1966,8 +2019,15 @@ if uploaded_files:
             for processed_index, (idx, row) in enumerate(run_df.iterrows(), start=1):
                 row_number = int(idx) + 1
                 row_dict = clean_row(row.drop(labels=["join_key"], errors="ignore").to_dict())
-                layer1_result = layer1_rule_based_screening(row_dict=row_dict)
-                complaint_record = build_complaint_record(row_dict=row_dict, row_number=row_number)
+                complaint_record = add_related_plis(
+                    build_complaint_record(row_dict=row_dict, row_number=row_number),
+                    row_dict=row_dict,
+                    related_pli_lookup=related_pli_lookup,
+                )
+                layer1_result = layer1_rule_based_screening(
+                    row_dict=row_dict,
+                    related_plis=complaint_record["relatedPlis"],
+                )
                 request_json = build_model_request_json(complaint_record)
                 try:
                     response = send_row_to_model(
@@ -2137,7 +2197,10 @@ if uploaded_files:
                             response_body = response.text
                         model_content = extract_model_content(response_body)
                         layer2_result = parse_layer2_response(response_body)
-                        layer1_result = layer1_rule_based_screening(row_dict=row_dict)
+                        layer1_result = layer1_rule_based_screening(
+                            row_dict=row_dict,
+                            related_plis=complaint_record.get("relatedPlis", []),
+                        )
                         layer3_result = layer3_prioritization(layer1_result, layer2_result)
                         categorization_result = build_clear_categorization(
                             layer1_result=layer1_result,
