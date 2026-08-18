@@ -73,9 +73,15 @@ def get_last_updated():
              tz=ZoneInfo("America/Chicago"),
          )
          return updated.strftime("%B %d, %Y at %I:%M %p %Z")
+def get_app_version():
+    version_path = Path(__file__).resolve().with_name("VERSION")
+    try:
+        return version_path.read_text(encoding="utf-8").strip().removeprefix("v")
+    except OSError:
+        return "Unknown"
 st.title("QA Monitoring Tool")
 st.caption(f"Raw complaint review prioritization for QA monitoring")
-st.caption(f"V1.0.6 - Last updated: {get_last_updated()}")
+st.caption(f"V{get_app_version()} - Last updated: {get_last_updated()}")
 st.markdown("""
 <style>
 :root {

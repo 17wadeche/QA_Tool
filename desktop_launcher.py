@@ -19,6 +19,7 @@ LATEST_RELEASE_API = (
 WINDOWS_ASSET_NAME = "QA-Monitoring-Tool-Windows.zip"
 EXECUTABLE_NAME = "QA-Monitoring-Tool.exe"
 MAX_UPDATE_SIZE = 500 * 1024 * 1024
+UPDATE_CHECK_INTERVAL_SECONDS = 5 * 60
 def bundled_path(filename):
     base_directory = Path(
         getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
@@ -38,6 +39,9 @@ def version_key(version):
         return parts + (0,) * (4 - len(parts))
     except ValueError:
         return ()
+def versions_match(left, right):
+    left_key = version_key(left)
+    return bool(left_key) and left_key == version_key(right)
 def find_windows_asset(release):
     return next(
         (
@@ -122,6 +126,7 @@ Remove-Item $updater -Recurse -Force
         ],
         creationflags=creation_flags,
         close_fds=True,
+        cwd=updater_directory,
     )
     os._exit(0)
 def check_for_updates():
@@ -156,12 +161,17 @@ def check_for_updates():
         staged_version = (staged_app / "VERSION").read_text(
             encoding="utf-8"
         ).strip()
-        if staged_version != latest_version:
+        if not versions_match(staged_version, latest_version):
             raise ValueError("Update version does not match release tag")
         install_and_restart(staged_app)
-    except Exception:
+    except Exception as error:
+        print(f"Automatic update check failed: {error}", file=sys.stderr)
         if workspace:
             shutil.rmtree(workspace, ignore_errors=True)
+def monitor_for_updates():
+    while True:
+        check_for_updates()
+        time.sleep(UPDATE_CHECK_INTERVAL_SECONDS)
 def find_available_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -191,7 +201,7 @@ def main():
         )
         
         raise SystemExit(1)
-    threading.Thread(target=check_for_updates, daemon=True).start()
+    threading.Thread(target=monitor_for_updates, daemon=True).start()
     port = find_available_port()
     threading.Thread(
         target=open_browser_when_ready,
