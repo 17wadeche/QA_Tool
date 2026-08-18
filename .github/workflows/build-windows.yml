@@ -37,6 +37,8 @@ jobs:
             --collect-all streamlit `
             --copy-metadata streamlit `
             --add-data "app.py;." `
+            --add-data "pli_context.py;." `
+            --add-data "prioritization.py;." `
             --add-data "VERSION;." `
             desktop_launcher.py
       - name: Create ZIP package
