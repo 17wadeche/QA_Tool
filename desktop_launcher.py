@@ -189,6 +189,7 @@ def main():
             f"Application file was not found:\n{app_path}",
             16,
         )
+        
         raise SystemExit(1)
     threading.Thread(target=check_for_updates, daemon=True).start()
     port = find_available_port()
