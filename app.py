@@ -75,7 +75,7 @@ def get_last_updated():
          return updated.strftime("%B %d, %Y at %I:%M %p %Z")
 st.title("QA Monitoring Tool")
 st.caption(f"Raw complaint review prioritization for QA monitoring")
-st.caption(f"Last updated: {get_last_updated()}")
+st.caption(f"V1.0.5 - Last updated: {get_last_updated()}")
 st.markdown("""
 <style>
 :root {
