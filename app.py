@@ -11,9 +11,11 @@ import time
 import pandas as pd
 import requests
 import streamlit as st
-import subprocess 
-from pathlib import Path 
+import subprocess
+from pathlib import Path
 from zoneinfo import ZoneInfo
+from pli_context import reconcile_layer2_with_pli_context
+from prioritization import layer3_prioritization
 def format_month_day_year(dt):
     return dt.strftime("%B ") + str(dt.day) + dt.strftime(", %Y")
 def get_last_updated_from_github():
@@ -266,7 +268,7 @@ DEFAULT_BASE_MODELS_URL = "https://api.gpt.medtronic.com/providers/medtronicgpt/
 DEFAULT_MODEL_ID = "gpt-41"
 SYSTEM_PROMPT = """You are assisting with QA post-process monitoring of raw complaint/product event handling. Review each record only for inconsistencies between coded fields and related record content. Do not make assumptions beyond the information provided. Do not make final regulatory, compliance, or clinical decisions.
 
-Each record may include multiple product line items (PLIs) for the same Product Event ID. Evaluate the current PLI in the context of all related PLIs, not as an isolated record. The event description can describe a problem with only one of several PLIs. Do not flag the other PLIs merely because their individual coding does not describe that problem. Flag coding only when the collective PLI context shows that the coding for the applicable PLI(s) is missing, contradictory, or otherwise inconsistent.
+Each record may include multiple product line items (PLIs) for the same Product Event ID. Review the complete relatedPlis collection as one product event before evaluating currentPli. The event description is event-level text and can describe a problem with only one of several PLIs. First identify the affected product from the narrative and match it to the related PLI using product description, PLI number, tasks, investigation details, and coding. Only then compare that PLI's coding with the description. A current PLI coded "no allegation" is not inconsistent merely because the shared event description documents an allegation against a different, appropriately coded sibling PLI. Do not flag the other PLIs merely because their individual coding does not describe that problem. Flag coding only when the complete product-event context shows that the coding for the applicable PLI(s) is missing, contradictory, or otherwise inconsistent.
 
 Focus only on these three checks:
 
@@ -294,7 +296,7 @@ USER_PROMPT_TEMPLATE = """Review the raw complaint/product event record below fo
 Evaluate only these three areas:
 
 Coding vs. Event Description
-Determine whether coded fields such as RFR Code and FDP Code are consistent with Event Description - PE and other narrative text. Cross-reference every related PLI for the Product Event ID before deciding. A problem that applies to one PLI does not require every sibling PLI to carry matching complaint coding.
+Determine whether coded fields such as RFR Code and FDP Code are consistent with Event Description - PE and other narrative text. Treat Event Description - PE as shared event-level context: identify the PLI to which each described problem applies before comparing coding. Cross-reference every related PLI for the Product Event ID before deciding. A problem that applies to one PLI does not require every sibling PLI to carry matching complaint coding. Specifically, do not report an inconsistency for a current PLI coded "no allegation" when the allegation belongs to another related PLI and that sibling PLI has corresponding allegation coding.
 
 Coding vs. Regulatory Decisions
 Determine whether coded fields and event severity are consistent with Reportable and country FER fields.
@@ -318,7 +320,7 @@ Use this decision logic:
 If no inconsistencies are found, set layer2_flag to No
 If one inconsistency is found, set layer2_flag to Yes and assign Low or Medium concern based on significance
 If two or more inconsistencies are found, set layer2_flag to Yes
-If any inconsistency could materially affect quality, compliance, or documentation interpretation, set concern_level to High
+Use High only for a clearly material issue supported by specific record evidence. Do not use High merely because one coding difference was identified. Tiering is performed separately, so concern_level must not be used as a general priority label.
 
 Return the result in exactly this format:
 
@@ -761,20 +763,6 @@ def build_complaint_record(row_dict, row_number):
         ],
         "data": row_dict,
     }
-PLI_CONTEXT_FIELDS = [
-    "Product Event ID",
-    "PE - PLI #",
-    "Complaint? - PE",
-    "Product Description - PE PLI",
-    "RFR Code",
-    "FDP Code",
-    "Reportable?",
-    "Investigation Required?",
-    "Event Description - PE",
-    "Summary of Investigation Results",
-    "PLI Tasks",
-    "Rationale for no return - PE PLI",
-]
 def build_related_pli_lookup(df):
     related_by_event = {}
     for idx, row in df.iterrows():
@@ -782,19 +770,21 @@ def build_related_pli_lookup(df):
         product_event_ids = extract_ids(row_dict.get("Product Event ID"))
         if not product_event_ids:
             continue
-        context = {
-            "sourceRowNumber": int(idx) + 1,
-            **{field: row_dict.get(field) for field in PLI_CONTEXT_FIELDS},
-        }
+        context = {"sourceRowNumber": int(idx) + 1, **row_dict}
         related_by_event.setdefault(product_event_ids[0], []).append(context)
     return related_by_event
 def add_related_plis(complaint_record, row_dict, related_pli_lookup):
     product_event_ids = extract_ids(row_dict.get("Product Event ID"))
     related_plis = related_pli_lookup.get(product_event_ids[0], []) if product_event_ids else []
-    complaint_record["relatedPlis"] = related_plis
+    complaint_record["relatedPlis"] = [
+        {**pli, "isCurrentPli": pli.get("sourceRowNumber") == complaint_record["rowNumber"]}
+        for pli in related_plis
+    ]
     complaint_record["pliEvaluationInstruction"] = (
-        "Evaluate currentPli using relatedPlis collectively. Do not treat a sibling PLI as "
-        "miscoded solely because the event description concerns a different PLI."
+        "Evaluate the complete relatedPlis collection as one product event before judging "
+        "currentPli. Use isCurrentPli to distinguish the row being scored. Attribute each "
+        "narrative issue to the applicable product first; do not treat a sibling PLI as "
+        "miscoded solely because shared event text concerns a different PLI."
     )
     return complaint_record
 def build_user_prompt(complaint_record):
@@ -1043,46 +1033,6 @@ def build_exact_inconsistency_found(layer2_result, row_dict):
         coding_text = " and ".join(code_parts)
         return f"Assigned coding ({coding_text}) does not align with the {', '.join(flagged_areas)}."
     return f"Assigned coding does not align with the {', '.join(flagged_areas)}."
-def layer3_prioritization(layer1_result, layer2_result):
-    score = layer1_result.get("layer1_score", 0)
-    reasons = []
-    if layer1_result.get("layer1_flags"):
-        reasons.append("Layer 1 flags present")
-    inconsistency_fields = [
-        "coding_event_description_inconsistency",
-        "coding_regulatory_decision_inconsistency",
-        "coding_investigation_decision_inconsistency",
-    ]
-    inconsistency_count = 0
-    for field in inconsistency_fields:
-        if str(layer2_result.get(field, "")).strip().lower() == "yes":
-            inconsistency_count += 1
-    if inconsistency_count > 0:
-        score += inconsistency_count * 2
-        reasons.append(f"{inconsistency_count} Layer 2 inconsistency checks flagged")
-    concern_level = str(layer2_result.get("concern_level", "")).strip().lower()
-    if concern_level == "high":
-        score += 4
-        reasons.append("Layer 2 concern level = High")
-    elif concern_level == "medium":
-        score += 2
-        reasons.append("Layer 2 concern level = Medium")
-    elif concern_level == "low":
-        score += 1
-        reasons.append("Layer 2 concern level = Low")
-    if inconsistency_count >= 2 or concern_level == "high" or score >= 8:
-        tier = 1
-    elif inconsistency_count == 1 or concern_level == "medium" or score >= 5:
-        tier = 2
-    elif score >= 2:
-        tier = 3
-    else:
-        tier = 4
-    return {
-        "priority_tier": tier,
-        "priority_score": score,
-        "priority_reasons": reasons,
-    }
 def build_clear_categorization(layer1_result, layer2_result, layer3_result, row_dict):
     layer1_flags = layer1_result.get("layer1_flags", [])
     layer1_reasons = layer1_result.get("layer1_reasons", [])
@@ -2077,6 +2027,9 @@ if uploaded_files:
                         response_body = response.text
                     model_content = extract_model_content(response_body)
                     layer2_result = parse_layer2_response(response_body)
+                    layer2_result = reconcile_layer2_with_pli_context(
+                        layer2_result, row_dict, complaint_record.get("relatedPlis", [])
+                    )
                     layer3_result = layer3_prioritization(layer1_result, layer2_result)
                     categorization_result = build_clear_categorization(
                         layer1_result=layer1_result,
@@ -2203,6 +2156,9 @@ if uploaded_files:
                             response_body = response.text
                         model_content = extract_model_content(response_body)
                         layer2_result = parse_layer2_response(response_body)
+                        layer2_result = reconcile_layer2_with_pli_context(
+                            layer2_result, row_dict, complaint_record.get("relatedPlis", [])
+                        )
                         layer1_result = layer1_rule_based_screening(
                             row_dict=row_dict,
                             related_plis=complaint_record.get("relatedPlis", []),
