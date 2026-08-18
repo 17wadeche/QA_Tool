@@ -8,7 +8,7 @@ import webbrowser
 from pathlib import Path
 import requests
 from streamlit.web import cli as stcli
-REPOSITORY = "rodaihassan/mdtgpt-complaint-review"
+REPOSITORY = "17wadeche/QA_Tool"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases/latest"
 LATEST_RELEASE_API = (
     f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
