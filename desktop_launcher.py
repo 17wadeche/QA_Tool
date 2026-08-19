@@ -20,6 +20,8 @@ WINDOWS_ASSET_NAME = "QA-Monitoring-Tool-Windows.zip"
 EXECUTABLE_NAME = "QA-Monitoring-Tool.exe"
 MAX_UPDATE_SIZE = 500 * 1024 * 1024
 UPDATE_CHECK_INTERVAL_SECONDS = 5 * 60
+WEBSOCKET_PING_INTERVAL_SECONDS = 30
+DISCONNECTED_SESSION_TTL_SECONDS = 24 * 60 * 60
 def bundled_path(filename):
     base_directory = Path(
         getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)
@@ -226,6 +228,8 @@ def main():
         "--server.address=127.0.0.1",
         f"--server.port={port}",
         "--server.headless=true",
+        f"--server.websocketPingInterval={WEBSOCKET_PING_INTERVAL_SECONDS}",
+        f"--server.disconnectedSessionTTL={DISCONNECTED_SESSION_TTL_SECONDS}",
         "--browser.gatherUsageStats=false",
     ]
     stcli.main()

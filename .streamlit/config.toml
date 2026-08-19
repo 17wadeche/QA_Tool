@@ -1,0 +1,3 @@
+[server]
+websocketPingInterval = 30
+disconnectedSessionTTL = 86400
