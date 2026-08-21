@@ -1703,6 +1703,10 @@ def merge_result_frames(*frames):
     combined = combined.sort_values("_successful", kind="stable")
     combined = combined.drop_duplicates(subset=["row_number"], keep="last")
     return combined.drop(columns=["_successful"]).sort_values("row_number").reset_index(drop=True)
+def save_processing_progress(results, preview_df, workbook_info):
+    st.session_state.processed_results = pd.DataFrame(results)
+    st.session_state.processed_preview_df = preview_df
+    st.session_state.processed_workbook_info = workbook_info
 def save_processing_checkpoint(results, preview_df, workbook_info):
     results_df = pd.DataFrame(results)
     organized_results_df, _ = build_tier_organization(results_df)
@@ -1927,7 +1931,8 @@ if uploaded_files:
             value=min(25, max(1, len(missing_row_numbers))),
             help=(
                 "The run automatically pauses after this many rows. A downloadable "
-                "checkpoint is rebuilt after every row, so you can safely stop between batches."
+                "checkpoint is rebuilt when the batch finishes. Completed rows are retained "
+                "in the current session while the batch runs."
             ),
         )
         st.info(
@@ -2121,7 +2126,7 @@ if uploaded_files:
                         "complaint_record": complaint_record,
                         "request_json": request_json,
                     })
-                save_processing_checkpoint(results, preview_df, workbook_info)
+                save_processing_progress(results, preview_df, workbook_info)
                 percent_complete = int((processed_index / len(run_df)) * 100)
                 progress.progress(percent_complete)
                 status_box.write(
