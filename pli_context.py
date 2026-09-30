@@ -6,19 +6,22 @@ def _text(value):
     return "" if text.lower() == "nan" else text
 def is_no_allegation_code(value):
     normalized = re.sub(r"[^a-z0-9]+", " ", _text(value).lower()).strip()
-    return "no allegation" in normalized
+    return bool(re.search(r"\bno(?:\s+[a-z0-9]+){0,3}\s+allegation\b", normalized))
+def _has_substantive_code(pli):
+    rfr_code = _text(pli.get("RFR Code"))
+    if rfr_code:
+        return not is_no_allegation_code(rfr_code)
+    fdp_code = _text(pli.get("FDP Code"))
+    return bool(fdp_code) and not is_no_allegation_code(fdp_code)
 def reconcile_layer2_with_pli_context(layer2_result, row_dict, related_plis=None):
     reconciled = dict(layer2_result)
     event_flag = _text(
         reconciled.get("coding_event_description_inconsistency")
     ).lower() == "yes"
     current_codes = [row_dict.get("RFR Code"), row_dict.get("FDP Code")]
-    current_has_no_allegation = any(is_no_allegation_code(code) for code in current_codes) and not any(
-        _text(code) and not is_no_allegation_code(code) for code in current_codes
-    )
+    current_has_no_allegation = any(is_no_allegation_code(code) for code in current_codes)
     sibling_has_allegation_coding = any(
-        (_text(pli.get("RFR Code")) and not is_no_allegation_code(pli.get("RFR Code")))
-        or (_text(pli.get("FDP Code")) and not is_no_allegation_code(pli.get("FDP Code")))
+        not pli.get("isCurrentPli") and _has_substantive_code(pli)
         for pli in (related_plis or [])
     )
     if not (event_flag and current_has_no_allegation and sibling_has_allegation_coding):

@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from pli_context import reconcile_layer2_with_pli_context
+from pli_deduplication import deduplicate_pli_rows
 from prioritization import layer3_prioritization
 def format_month_day_year(dt):
     return dt.strftime("%B ") + str(dt.day) + dt.strftime(", %Y")
@@ -1869,6 +1870,12 @@ if uploaded_files:
         main_df = ensure_key_columns(processed_sheets[main_sheet_name]["df"])
         main_df = add_join_key(main_df)
         main_df = main_df[main_df["join_key"].notna() & (main_df["join_key"].astype(str) != "")].copy()
+        main_df, duplicate_pli_count = deduplicate_pli_rows(main_df)
+        if duplicate_pli_count:
+            st.info(
+                f"Removed {duplicate_pli_count} duplicate PLI row(s) before review. "
+                "Each PE/PLI combination will be evaluated once."
+            )
         related_pli_lookup = build_related_pli_lookup(main_df)
         preview_df = main_df.copy()
         st.subheader("Main Sheet Preview")
